@@ -1,76 +1,677 @@
 import os
 from pathlib import Path
+
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
+
 from google import genai
 from google.genai import types
+
 import chromadb
 from pypdf import PdfReader
 
-load_dotenv()
-API_KEY = os.getenv('GEMINI_API_KEY')
-if not API_KEY:
-    raise RuntimeError('GEMINI_API_KEY is missing. Add it to your .env file.')
-client = genai.Client(api_key=API_KEY)
-app = Flask(__name__)
-UPLOAD_FOLDER = Path('uploads'); UPLOAD_FOLDER.mkdir(exist_ok=True)
-app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
-app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
-chroma_client = chromadb.PersistentClient(path='chroma_db')
-collection = chroma_client.get_or_create_collection(name='traditional_handicraft_knowledge')
-EMBED_MODEL = 'gemini-embedding-001'
-GEN_MODEL = 'gemini-3.5-flash'
 
-def chunk_text(text, chunk_size=900, overlap=150):
-    text=' '.join(text.split()); chunks=[]; start=0
+# =========================================================
+# LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY is missing. Please create a .env file "
+        "and add your Gemini API key."
+    )
+
+
+# =========================================================
+# GEMINI CLIENT
+# =========================================================
+
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+
+# =========================================================
+# FLASK APP
+# =========================================================
+
+app = Flask(__name__)
+
+UPLOAD_FOLDER = Path("uploads")
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
+
+# Maximum PDF size = 20 MB
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+
+# =========================================================
+# CHROMADB
+# =========================================================
+
+chroma_client = chromadb.PersistentClient(
+    path="chroma_db"
+)
+
+collection = chroma_client.get_or_create_collection(
+    name="traditional_handicraft_knowledge"
+)
+
+
+# =========================================================
+# MODELS
+# =========================================================
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+
+GENERATION_MODEL = "gemini-3.5-flash"
+
+
+# =========================================================
+# TEXT CHUNKING
+# =========================================================
+
+def chunk_text(
+    text,
+    chunk_size=900,
+    overlap=150
+):
+    """
+    Split PDF text into smaller overlapping chunks.
+    """
+
+    text = " ".join(text.split())
+
+    chunks = []
+
+    start = 0
+
     while start < len(text):
-        end=start+chunk_size; chunk=text[start:end].strip()
-        if chunk: chunks.append(chunk)
-        if end >= len(text): break
-        start=end-overlap
+
+        end = start + chunk_size
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= len(text):
+            break
+
+        start = end - overlap
+
     return chunks
 
-def embed(text, task_type):
-    r=client.models.embed_content(model=EMBED_MODEL, contents=text, config=types.EmbedContentConfig(task_type=task_type))
-    return r.embeddings[0].values
+
+# =========================================================
+# GEMINI EMBEDDING
+# =========================================================
+
+def create_embedding(
+    text,
+    task_type
+):
+    """
+    Create Gemini embedding for text.
+    """
+
+    response = client.models.embed_content(
+
+        model=EMBEDDING_MODEL,
+
+        contents=text,
+
+        config=types.EmbedContentConfig(
+            task_type=task_type
+        )
+    )
+
+    return response.embeddings[0].values
+
+
+# =========================================================
+# PROCESS PDF
+# =========================================================
 
 def process_pdf(pdf_path):
-    reader=PdfReader(str(pdf_path)); text='\n'.join((p.extract_text() or '') for p in reader.pages).strip()
-    if not text: raise ValueError('No readable text was found in the PDF.')
-    chunks=chunk_text(text); source=pdf_path.name
-    for i, chunk in enumerate(chunks):
-        collection.upsert(ids=[f'{source}-{i}'], embeddings=[embed(chunk,'RETRIEVAL_DOCUMENT')], documents=[chunk], metadatas=[{'source':source,'chunk':i}])
-    return len(chunks)
 
-@app.route('/')
-def home(): return render_template('index.html')
+    reader = PdfReader(
+        str(pdf_path)
+    )
 
-@app.route('/upload', methods=['POST'])
+    pages = []
+
+    for page in reader.pages:
+
+        page_text = page.extract_text()
+
+        if page_text:
+            pages.append(page_text)
+
+    full_text = "\n".join(pages).strip()
+
+    if not full_text:
+
+        raise ValueError(
+            "The PDF does not contain readable text."
+        )
+
+    chunks = chunk_text(full_text)
+
+    source_name = pdf_path.name
+
+    added_chunks = 0
+
+    for index, chunk in enumerate(chunks):
+
+        embedding = create_embedding(
+            chunk,
+            "RETRIEVAL_DOCUMENT"
+        )
+
+        document_id = (
+            f"{source_name}-{index}"
+        )
+
+        collection.upsert(
+
+            ids=[document_id],
+
+            embeddings=[embedding],
+
+            documents=[chunk],
+
+            metadatas=[
+                {
+                    "source": source_name,
+                    "chunk": index
+                }
+            ]
+        )
+
+        added_chunks += 1
+
+    return added_chunks
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
+
+@app.route("/")
+def home():
+
+    return render_template(
+        "index.html"
+    )
+
+
+# =========================================================
+# PDF UPLOAD API
+# =========================================================
+
+@app.route(
+    "/upload",
+    methods=["POST"]
+)
 def upload_pdf():
-    if 'file' not in request.files: return jsonify(error='Please select a PDF file.'),400
-    file=request.files['file']
-    if not file.filename: return jsonify(error='Please select a PDF file.'),400
-    if not file.filename.lower().endswith('.pdf'): return jsonify(error='Only PDF files are supported.'),400
-    path=UPLOAD_FOLDER/secure_filename(file.filename); file.save(path)
-    try: return jsonify(message=f'PDF uploaded successfully. {process_pdf(path)} knowledge chunks added.', source=path.name)
-    except Exception as e:
-        if path.exists(): path.unlink()
-        return jsonify(error=str(e)),500
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    q=((request.get_json(silent=True) or {}).get('message') or '').strip()
-    if not q: return jsonify(answer='Please enter a question.'),400
-    if collection.count()==0: return jsonify(answer='Please upload a handicraft PDF first.')
     try:
-        qr=embed(q,'RETRIEVAL_QUERY'); results=collection.query(query_embeddings=[qr], n_results=min(5,collection.count()))
-        docs=results.get('documents',[[]])[0]; metas=results.get('metadatas',[[]])[0]
-        if not docs: return jsonify(answer="Sorry, I don't have that information in my knowledge base.")
-        context='\n\n'.join(f"[Source: {m.get('source','PDF')}]\n{d}" for d,m in zip(docs,metas))
-        prompt=f'''You are a Traditional Handicraft Knowledge Assistant.\nAnswer using ONLY the provided context. If unavailable, say: "Sorry, I don't have that information in my knowledge base." Do not invent facts.\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{q}'''
-        r=client.models.generate_content(model=GEN_MODEL, contents=prompt)
-        return jsonify(answer=r.text or 'Sorry, I could not generate an answer.', sources=sorted(set(m.get('source','PDF') for m in metas if m)))
-    except Exception as e: return jsonify(error=str(e)),500
 
-if __name__=='__main__': app.run(debug=True)
+        # Check file field
+        if "file" not in request.files:
+
+            return jsonify({
+                "success": False,
+                "error": "No PDF file was selected."
+            }), 400
+
+
+        file = request.files["file"]
+
+
+        # Check filename
+        if not file.filename:
+
+            return jsonify({
+                "success": False,
+                "error": "Please select a PDF file."
+            }), 400
+
+
+        # Only PDF
+        if not file.filename.lower().endswith(".pdf"):
+
+            return jsonify({
+                "success": False,
+                "error": "Only PDF files are allowed."
+            }), 400
+
+
+        # Secure filename
+        filename = secure_filename(
+            file.filename
+        )
+
+
+        # Save PDF
+        pdf_path = (
+            UPLOAD_FOLDER / filename
+        )
+
+        file.save(pdf_path)
+
+
+        # Process PDF
+        chunk_count = process_pdf(
+            pdf_path
+        )
+
+
+        return jsonify({
+
+            "success": True,
+
+            "message": (
+                f"PDF uploaded successfully. "
+                f"{chunk_count} knowledge chunks added."
+            ),
+
+            "source": filename,
+
+            "chunks": chunk_count
+
+        }), 200
+
+
+    except Exception as e:
+
+        print(
+            "\nUPLOAD ERROR:"
+        )
+
+        print(
+            str(e)
+        )
+
+
+        return jsonify({
+
+            "success": False,
+
+            "error": str(e)
+
+        }), 500
+
+
+# =========================================================
+# CHAT API
+# =========================================================
+
+@app.route(
+    "/chat",
+    methods=["POST"]
+)
+def chat():
+
+    try:
+
+        # Get JSON safely
+        data = request.get_json(
+            silent=True
+        )
+
+
+        if not data:
+
+            return jsonify({
+
+                "success": False,
+
+                "answer": (
+                    "Invalid request."
+                )
+
+            }), 400
+
+
+        question = (
+            data.get("message", "")
+            .strip()
+        )
+
+
+        if not question:
+
+            return jsonify({
+
+                "success": False,
+
+                "answer": (
+                    "Please enter a question."
+                )
+
+            }), 400
+
+
+        # Check knowledge base
+        document_count = (
+            collection.count()
+        )
+
+
+        if document_count == 0:
+
+            return jsonify({
+
+                "success": True,
+
+                "answer": (
+                    "Please upload a "
+                    "traditional handicraft PDF first."
+                ),
+
+                "sources": []
+
+            }), 200
+
+
+        # =================================================
+        # CREATE QUERY EMBEDDING
+        # =================================================
+
+        query_embedding = create_embedding(
+
+            question,
+
+            "RETRIEVAL_QUERY"
+
+        )
+
+
+        # =================================================
+        # SEARCH CHROMADB
+        # =================================================
+
+        results = collection.query(
+
+            query_embeddings=[
+                query_embedding
+            ],
+
+            n_results=min(
+                5,
+                document_count
+            )
+        )
+
+
+        documents = (
+            results.get(
+                "documents",
+                [[]]
+            )[0]
+        )
+
+
+        metadatas = (
+            results.get(
+                "metadatas",
+                [[]]
+            )[0]
+        )
+
+
+        # No matching documents
+        if not documents:
+
+            return jsonify({
+
+                "success": True,
+
+                "answer": (
+                    "Sorry, I don't have "
+                    "that information in my "
+                    "knowledge base."
+                ),
+
+                "sources": []
+
+            }), 200
+
+
+        # =================================================
+        # CREATE CONTEXT
+        # =================================================
+
+        context_parts = []
+
+
+        for document, metadata in zip(
+            documents,
+            metadatas
+        ):
+
+            source = metadata.get(
+                "source",
+                "Uploaded PDF"
+            )
+
+            context_parts.append(
+
+                f"[Source: {source}]\n"
+                f"{document}"
+
+            )
+
+
+        context = "\n\n".join(
+            context_parts
+        )
+
+
+        # =================================================
+        # RAG PROMPT
+        # =================================================
+
+        prompt = f"""
+
+You are the Traditional Handicraft
+Knowledge Assistant.
+
+Your job is to answer questions ONLY
+using information from the uploaded
+PDF knowledge base.
+
+IMPORTANT RULES:
+
+1. Use ONLY the provided context.
+2. Do NOT use outside knowledge.
+3. Do NOT invent information.
+4. If the answer is not available in
+   the context, reply exactly:
+
+"Sorry, I don't have that information
+in my knowledge base."
+
+5. Keep answers simple and clear.
+6. Do not answer unrelated questions.
+
+========================
+UPLOADED PDF CONTEXT
+========================
+
+{context}
+
+========================
+USER QUESTION
+========================
+
+{question}
+
+========================
+ANSWER
+========================
+
+"""
+
+
+        # =================================================
+        # GENERATE ANSWER
+        # =================================================
+
+        response = client.models.generate_content(
+
+            model=GENERATION_MODEL,
+
+            contents=prompt
+
+        )
+
+
+        answer = (
+            response.text
+            if response.text
+            else
+            "Sorry, I could not generate an answer."
+        )
+
+
+        # =================================================
+        # SOURCES
+        # =================================================
+
+        sources = sorted(
+            set(
+                metadata.get(
+                    "source",
+                    "Uploaded PDF"
+                )
+
+                for metadata in metadatas
+
+                if metadata
+            )
+        )
+
+
+        return jsonify({
+
+            "success": True,
+
+            "answer": answer,
+
+            "sources": sources
+
+        }), 200
+
+
+    except Exception as e:
+
+        print(
+            "\nCHAT ERROR:"
+        )
+
+        print(
+            str(e)
+        )
+
+
+        return jsonify({
+
+            "success": False,
+
+            "error": str(e),
+
+            "answer": (
+                "Sorry, an error occurred "
+                "while processing your question."
+            )
+
+        }), 500
+
+
+# =========================================================
+# ERROR HANDLERS
+# =========================================================
+
+@app.errorhandler(
+    413
+)
+def file_too_large(error):
+
+    return jsonify({
+
+        "success": False,
+
+        "error": (
+            "PDF file is too large. "
+            "Maximum size is 20 MB."
+        )
+
+    }), 413
+
+
+@app.errorhandler(
+    404
+)
+def page_not_found(error):
+
+    return jsonify({
+
+        "success": False,
+
+        "error": "Page not found."
+
+    }), 404
+
+
+@app.errorhandler(
+    500
+)
+def internal_error(error):
+
+    return jsonify({
+
+        "success": False,
+
+        "error": "Internal server error."
+
+    }), 500
+
+
+# =========================================================
+# RUN APPLICATION
+# =========================================================
+
+if __name__ == "__main__":
+
+    print(
+        "\n=========================================="
+    )
+
+    print(
+        "Traditional Handicraft RAG Chatbot"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        "Open: http://127.0.0.1:5000"
+    )
+
+    print(
+        "==========================================\n"
+    )
+
+    app.run(
+        debug=True
+    )
